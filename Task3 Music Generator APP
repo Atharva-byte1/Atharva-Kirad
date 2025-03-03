@@ -1,0 +1,296 @@
+import numpy as np
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+import pretty_midi
+import os
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+# Configuration parameters
+SEQUENCE_LENGTH = 64  # Number of notes in a sequence
+EPOCHS = 50
+BATCH_SIZE = 64
+LSTM_UNITS = 256
+EMBEDDING_DIM = 128
+LEARNING_RATE = 0.001
+
+class MusicGenerator:
+    def init(self, model_path=None):
+        self.sequence_length = SEQUENCE_LENGTH
+        self.midi_files = []
+        self.notes = []
+        self.note_to_index = {}
+        self.index_to_note = {}
+        self.model = None
+        
+        if model_path and os.path.exists(model_path):
+            self.load_model(model_path)
+    
+    def load_midi_files(self, directory):
+        """Load all MIDI files from the specified directory."""
+        print(f"Loading MIDI files from {directory}...")
+        self.midi_files = [os.path.join(directory, f) for f in os.listdir(directory) 
+                           if f.endswith('.mid') or f.endswith('.midi')]
+        print(f"Found {len(self.midi_files)} MIDI files")
+        return self.midi_files
+    
+    def extract_notes(self):
+        """Extract notes from all loaded MIDI files."""
+        all_notes = []
+        
+        for file in self.midi_files:
+            try:
+                midi_data = pretty_midi.PrettyMIDI(file)
+                print(f"Processing {file}...")
+                
+                for instrument in midi_data.instruments:
+                    # Skip drum tracks
+                    if not instrument.is_drum:
+                        for note in instrument.notes:
+                            # Encode note as pitch_start-duration
+                            note_encoding = f"{note.pitch}{note.start:.2f}{note.duration:.2f}"
+                            all_notes.append(note_encoding)
+            except Exception as e:
+                print(f"Error processing {file}: {e}")
+        
+        self.notes = all_notes
+        print(f"Extracted {len(self.notes)} notes")
+        
+        # Create vocabulary
+        unique_notes = sorted(set(all_notes))
+        self.note_to_index = {note: i for i, note in enumerate(unique_notes)}
+        self.index_to_note = {i: note for i, note in enumerate(unique_notes)}
+        
+        print(f"Vocabulary size: {len(unique_notes)}")
+        return all_notes
+    
+    def prepare_sequences(self):
+        """Prepare sequences for training."""
+        network_input = []
+        network_output = []
+        
+        # Create input sequences and corresponding outputs
+        for i in range(0, len(self.notes) - self.sequence_length):
+            sequence_in = self.notes[i:i + self.sequence_length]
+            sequence_out = self.notes[i + self.sequence_length]
+            
+            network_input.append([self.note_to_index[note] for note in sequence_in])
+            network_output.append(self.note_to_index[sequence_out])
+        
+        n_patterns = len(network_input)
+        
+        # Reshape input to match LSTM requirements: [samples, time steps, features]
+        network_input = np.reshape(network_input, (n_patterns, self.sequence_length, 1))
+        
+        # Normalize input
+        network_input = network_input / float(len(self.note_to_index))
+        
+        # One-hot encode the output
+        network_output = tf.keras.utils.to_categorical(network_output, num_classes=len(self.note_to_index))
+        
+        return network_input, network_output
+    
+    def build_model(self):
+        """Build the LSTM model."""
+        vocab_size = len(self.note_to_index)
+        
+        model = keras.Sequential([
+            layers.Input(shape=(self.sequence_length, 1)),
+            layers.LSTM(LSTM_UNITS, return_sequences=True),
+            layers.Dropout(0.3),
+            layers.LSTM(LSTM_UNITS),
+            layers.Dropout(0.3),
+            layers.Dense(256, activation='relu'),
+            layers.Dense(vocab_size, activation='softmax')
+        ])
+        
+        optimizer = keras.optimizers.Adam(learning_rate=LEARNING_RATE)
+        model.compile(loss='categorical_crossentropy', optimizer=optimizer, metrics=['accuracy'])
+        
+        self.model = model
+        model.summary()
+        return model
+    
+    def train(self, input_data, output_data):
+        """Train the model on the prepared data."""
+        if self.model is None:
+            self.build_model()
+        
+        # Create a callback to save the model after each epoch
+        checkpoint_path = f"model_checkpoints/model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+        
+        checkpoint_callback = keras.callbacks.ModelCheckpoint(
+            filepath=checkpoint_path + "_{epoch:02d}",
+            save_weights_only=True,
+            save_best_only=True,
+            monitor='loss',
+            mode='min'
+        )
+        
+        early_stopping = keras.callbacks.EarlyStopping(
+            monitor='loss',
+            patience=5,
+            restore_best_weights=True
+        )
+        
+        # Plot training history
+        history = self.model.fit(
+            input_data, 
+            output_data,
+            epochs=EPOCHS,
+            batch_size=BATCH_SIZE,
+            callbacks=[checkpoint_callback, early_stopping]
+        )
+        
+        # Save the final model
+        self.save_model("final_model")
+        
+        # Plot loss and accuracy
+        plt.figure(figsize=(12, 5))
+        
+        plt.subplot(1, 2, 1)
+        plt.plot(history.history['loss'])
+        plt.title('Model Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(history.history['accuracy'])
+        plt.title('Model Accuracy')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        
+        plt.tight_layout()
+        plt.savefig('training_history.png')
+        plt.close()
+        
+        return history
+    
+    def save_model(self, filename):
+        """Save the model weights and vocabulary."""
+        if self.model is not None:
+            # Save model weights
+            self.model.save_weights(f"{filename}.weights.h5")
+            
+            # Save vocabulary
+            with open(f"{filename}.vocab.txt", 'w') as f:
+                for note, index in self.note_to_index.items():
+                    f.write(f"{note}\t{index}\n")
+            
+            print(f"Model saved as {filename}")
+    
+    def load_model(self, model_path):
+        """Load a previously saved model and vocabulary."""
+        # Load vocabulary
+        self.note_to_index = {}
+        self.index_to_note = {}
+        
+        with open(f"{model_path}.vocab.txt", 'r') as f:
+            for line in f:
+                note, index = line.strip().split('\t')
+                index = int(index)
+                self.note_to_index[note] = index
+                self.index_to_note[index] = note
+        
+        # Build model architecture
+        self.build_model()
+        
+        # Load weights
+        self.model.load_weights(f"{model_path}.weights.h5")
+        
+        print(f"Model loaded from {model_path}")
+    
+    def generate_music(self, start_sequence=None, length=500, temperature=1.0):
+        """Generate a sequence of notes using the trained model."""
+        if self.model is None:
+            raise Exception("Model not trained or loaded")
+        
+        # If no start sequence provided, randomly select one from the notes
+        if start_sequence is None:
+            start_idx = np.random.randint(0, len(self.notes) - self.sequence_length)
+            start_sequence = self.notes[start_idx:start_idx + self.sequence_length]
+        
+        # Convert start sequence to indices
+        pattern = [self.note_to_index[note] for note in start_sequence]
+        
+        # Generate notes
+        generated_notes = []
+        
+        for _ in range(length):
+            # Format prediction input
+            x_pred = np.reshape(pattern, (1, len(pattern), 1)) / float(len(self.note_to_index))
+            
+            # Make prediction
+            prediction = self.model.predict(x_pred, verbose=0)[0]
+            
+            # Apply temperature
+            prediction = np.log(prediction) / temperature
+            prediction = np.exp(prediction) / np.sum(np.exp(prediction))
+            
+            # Sample from the prediction
+            next_index = np.random.choice(len(prediction), p=prediction)
+            
+            # Get the corresponding note
+            next_note = self.index_to_note[next_index]
+            generated_notes.append(next_note)
+            
+            # Update the pattern
+            pattern.append(next_index)
+            pattern = pattern[1:]
+        
+        return generated_notes
+    
+    def create_midi(self, generated_notes, filename="generated_music.mid"):
+        """Convert the generated notes to a MIDI file."""
+        midi = pretty_midi.PrettyMIDI()
+        piano = pretty_midi.Instrument(program=0)  # Piano
+        
+        current_time = 0.0
+        
+        for note_str in generated_notes:
+            # Parse the note encoding: pitch_start_duration
+            parts = note_str.split('_')
+            pitch = int(parts[0])
+            duration = float(parts[2])
+            
+            # Create the note
+            note = pretty_midi.Note(
+                velocity=100,  # Velocity (volume)
+                pitch=pitch,
+                start=current_time,
+                end=current_time + duration
+            )
+            
+            piano.notes.append(note)
+            current_time += duration * 0.5  # Overlap notes slightly for smoother transitions
+        
+        midi.instruments.append(piano)
+        midi.write(filename)
+        print(f"MIDI file saved as {filename}")
+        return filename
+
+# Example usage
+if name == "main":
+    # Create the generator
+    generator = MusicGenerator()
+    
+    # Load MIDI files (you'll need to replace with your own dataset path)
+    generator.load_midi_files("path/to/midi/files")
+    
+    # Extract notes
+    generator.extract_notes()
+    
+    # Prepare sequences for training
+    inputs, outputs = generator.prepare_sequences()
+    
+    # Build and train the model
+    generator.build_model()
+    generator.train(inputs, outputs)
+    
+    # Generate new music
+    generated_notes = generator.generate_music(temperature=0.8)
+    
+    # Create MIDI file
+    generator.create_midi(generated_notes, "ai_generated_music.mid")
